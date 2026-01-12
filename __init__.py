@@ -97,12 +97,15 @@ def main(bv):
                         f"Added tag {panic_location_path} at {code_ref_address}"
                     )
 
+    bv.begin_undo_actions()
+
     source_file_paths = find_string_slice_variables_containing_source_file_path(bv)
     panic_locations = set_panic_locations_from_source_file_path_string_variables(
         bv, source_file_paths
     )
     find_panic_location_code_refs_and_set_tags(bv, panic_locations)
 
+    bv.commit_undo_actions()
     bv.update_analysis()
 
 
