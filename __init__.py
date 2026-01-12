@@ -30,7 +30,12 @@ def main(bv):
                     string_data = bv.get_data_var_at(string_address)
                     if string_data is not None:
                         # TODO: This assumes that the string here is already the correct length
-                        candidate_path = string_data.value.decode("utf-8")
+
+                        if isinstance(string_data.value, bytes):
+                            candidate_path = string_data.value.decode("utf-8")
+                        elif isinstance(string_data.value, str):
+                            candidate_path = string_data.value
+
                         if "windows" in bv.platform.name:
                             candidate_path = PureWindowsPath(candidate_path)
                         else:
