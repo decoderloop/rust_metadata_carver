@@ -22,10 +22,10 @@ def main(bv):
     ) -> List[DataVariable]:
         source_file_path_data_vars = []
         # TODO: Make this independent of the rust_string_slicer plugin
-        for rust_string_slice_data_ref in bv.get_data_refs_for_type("RustStringSlice"):
+        for rust_string_slice_data_ref in bv.get_data_refs_for_type("&str"):
             rust_string_slice_data = bv.get_data_var_at(rust_string_slice_data_ref)
             if rust_string_slice_data is not None:
-                string_address = rust_string_slice_data.value.get("address")
+                string_address = rust_string_slice_data.value.get("_address")
                 if string_address is not None:
                     string_data = bv.get_data_var_at(string_address)
                     if string_data is not None:
@@ -65,7 +65,7 @@ def main(bv):
     ):
         for panic_location_data_variable in panic_locations:
             panic_location_file_path_string_address = (
-                panic_location_data_variable.value["file"]["address"]
+                panic_location_data_variable.value["file"]["_address"]
             )
             panic_location_file_path_string_data = bv.get_data_var_at(
                 panic_location_file_path_string_address
