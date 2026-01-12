@@ -1,24 +1,97 @@
+from dataclasses import dataclass
 from typing import Dict, List
 from pathlib import PureWindowsPath, PurePosixPath
 
 from binaryninja.binaryview import BinaryView, DataVariable
 from binaryninja.log import Logger
 from binaryninja.plugin import PluginCommand
+from binaryninja.types import (
+    StructureBuilder,
+    IntegerType,
+    PointerType,
+    Type,
+    NamedTypeReferenceType,
+)
 
-# Note that this is a sample plugin and you may need to manually edit it with
-# additional functionality. In particular, this example only passes in the
-# binary view. If you would like to act on an addres or function you should
-# consider using other register_for* functions.
+logger = Logger(session_id=0, logger_name=__name__)
 
-# Add documentation about UI plugin alternatives and potentially getting
-# current_* functions
+
+@dataclass
+class CorePanicLocation:
+    """
+    Class to work with the core::panic::Location type in the Rust core library
+    (https://doc.rust-lang.org/beta/core/panic/struct.Location.html)
+
+    This assumes that the layout of the core::panic::Location
+    struct is always the following (pseudo-C, packed)
+    representation:
+
+
+    ```
+    struct core::panic::Location
+    {
+        `&str` file;
+        uint32_t line;
+        uint32_t col;
+    };
+    ```
+
+    While in theory this layout could change and is dependent
+    on the Rust compiler's whims, in practice, from observing
+    lots of Rust binaries, it is always this layout.
+    """
+
+    @classmethod
+    def check_binary_ninja_type_exists(cls, bv: BinaryView) -> bool:
+        return bv.get_type_by_name("core::panic::Location") is not None
+
+    @classmethod
+    def create_binary_ninja_type(cls, bv: BinaryView):
+        if bv.arch is not None:
+            rust_core_panic_location_bn_type_obj = StructureBuilder.create(packed=True)
+
+            rust_core_panic_location_bn_type_obj.append(
+                type=NamedTypeReferenceType.create_from_registered_type(bv, "&str"),
+                name="file",
+            )
+
+            rust_core_panic_location_bn_type_obj.append(
+                type=IntegerType.create(width=4), name="line"
+            )
+            rust_core_panic_location_bn_type_obj.append(
+                type=IntegerType.create(width=4), name="col"
+            )
+
+            bv.define_user_type(
+                name="core::panic::Location",
+                type_obj=rust_core_panic_location_bn_type_obj,
+            )
+            logger.log_info(
+                f"Defined new type, `core::panic::Location`, for Rust panic metadata"
+            )
+
+    @classmethod
+    def create_binary_ninja_instance(
+        cls, bv: BinaryView, location: int, name: str
+    ) -> DataVariable | None:
+        data_variable = bv.define_user_data_var(
+            addr=location, var_type="`core::panic::Location`", name=name
+        )
+        logger.log_info(f"Defined new `core::panic::Location` at {location:#x}")
+
+        if data_variable is None:
+            logger.log_error(
+                "Unable to create `core::panic::Location` data variable at {location:#x}"
+            )
+
+        return data_variable
 
 
 def main(bv):
     logger = Logger(session_id=0, logger_name=__name__)
 
     def find_string_slice_variables_containing_source_file_path(
-        bv: BinaryView
+        bv: BinaryView,
     ) -> List[DataVariable]:
         source_file_path_data_vars = []
         # TODO: Make this independent of the rust_string_slicer plugin
@@ -28,7 +101,7 @@ def main(bv):
                 string_address = rust_string_slice_data.value.get("_address")
                 if string_address is not None:
                     string_data = bv.get_data_var_at(string_address)
-                    if string_data is not None:
+                    if string_data is not None and string_data.value is not None:
                         # TODO: This assumes that the string here is already the correct length
 
                         if isinstance(string_data.value, bytes):
@@ -45,23 +118,23 @@ def main(bv):
 
         return source_file_path_data_vars
 
-    # TODO: This relies on you having defined and figured out the layout of core::panic::Location first
     def set_panic_locations_from_source_file_path_string_variables(
         bv: BinaryView, source_file_paths: List[DataVariable]
     ) -> List[DataVariable]:
         panic_location_data_vars = []
-        panic_location_type = bv.get_type_by_name("core::panic::Location")
-        if panic_location_type is not None:
+
+        if CorePanicLocation.check_binary_ninja_type_exists(bv):
             for source_file_path_data_variable in source_file_paths:
-                panic_location_data_var = bv.define_user_data_var(
-                    addr=source_file_path_data_variable.address,
-                    var_type=panic_location_type,
-                    name=f"panic_location_{source_file_path_data_variable.name}",
+                panic_location_data_var = (
+                    CorePanicLocation.create_binary_ninja_instance(
+                        bv=bv,
+                        location=source_file_path_data_variable.address,
+                        name=f"panic_location_{source_file_path_data_variable.name}",
+                    )
                 )
-                logger.log_info(
-                    f"Defined core::panic::location struct at {source_file_path_data_variable.address:#x}"
-                )
-                panic_location_data_vars.append(panic_location_data_var)
+
+                if panic_location_data_var is not None:
+                    panic_location_data_vars.append(panic_location_data_var)
 
         return panic_location_data_vars
 
@@ -101,6 +174,8 @@ def main(bv):
                     logger.log_info(
                         f"Added tag {panic_location_path} at {code_ref_address}"
                     )
+
+    CorePanicLocation.create_binary_ninja_type(bv)
 
     bv.begin_undo_actions()
 
