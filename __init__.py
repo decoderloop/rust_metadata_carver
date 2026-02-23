@@ -2,9 +2,15 @@ from dataclasses import dataclass
 from typing import Dict, List
 from pathlib import PureWindowsPath, PurePosixPath
 
-from binaryninja.binaryview import BinaryView, DataVariable
+from binaryninja.binaryview import (
+    BinaryView,
+    DataVariable,
+    Section,
+    SectionSemantics,
+    Segment,
+)
 from binaryninja.log import Logger
-from binaryninja.plugin import PluginCommand
+from binaryninja.plugin import BackgroundTaskThread, PluginCommand
 from binaryninja.types import (
     StructureBuilder,
     IntegerType,
@@ -14,6 +20,38 @@ from binaryninja.types import (
 )
 
 logger = Logger(session_id=0, logger_name=__name__)
+
+
+class RustStringSlice:
+    """
+    Class to work with the string slice type in Rust, &str
+    """
+
+    @classmethod
+    def check_binary_ninja_type_exists(cls, bv: BinaryView) -> bool:
+        return bv.get_type_by_name("&str") is not None
+
+    @classmethod
+    def create_binary_ninja_type(cls, bv: BinaryView):
+        if bv.arch is not None:
+            rust_string_slice_bn_type_obj = StructureBuilder.create(packed=True)
+            rust_string_slice_bn_type_obj.append(
+                type=PointerType.create(arch=bv.arch, type=Type.char()), name="_address"
+            )
+            rust_string_slice_bn_type_obj.append(
+                type=IntegerType.create(width=bv.arch.address_size), name="_length"
+            )
+
+            bv.define_user_type(
+                name="&str",
+                type_obj=rust_string_slice_bn_type_obj,
+            )
+            logger.log_info(f"Defined new type, `&str`, for Rust string slices")
+
+    @classmethod
+    def create_binary_ninja_instance(cls, bv: BinaryView, location: int, name: str):
+        bv.define_user_data_var(addr=location, var_type="`&str`", name=name)
+        logger.log_info(f"Defined new `&str` at {location:#x}")
 
 
 @dataclass
@@ -87,8 +125,162 @@ class CorePanicLocation:
         return data_variable
 
 
-def main(bv):
-    logger = Logger(session_id=0, logger_name=__name__)
+class RecoverPanicPathStringsFromReadOnlyDataTask(BackgroundTaskThread):
+    def __init__(self, bv: BinaryView):
+        super().__init__(
+            initial_progress_text="Recovering Rust panic path metadata strings from readonly data...",
+            can_cancel=True,
+        )
+        self.bv = bv
+
+    def run(self):
+        if self.bv.arch is None:
+            logger.log_error(
+                "Could not get architecture of current binary view, exiting"
+            )
+            return
+
+        readonly_segments: List[Segment] = list(
+            filter(
+                lambda segment: segment.readable
+                and not segment.writable
+                and not segment.executable,
+                self.bv.segments,
+            )
+        )
+
+        readonly_sections: List[Section] = list(
+            filter(
+                lambda section: section.semantics
+                == SectionSemantics.ReadOnlyDataSectionSemantics,
+                self.bv.sections.values(),
+            )
+        )
+
+        if len(readonly_segments) == 0 and len(readonly_sections) == 0:
+            logger.log_error(
+                "Could not find any read-only segments or sections in binary, exiting"
+            )
+            return
+
+        self.bv.begin_undo_actions()
+
+        # Obtain all data vars which are pointers to data in read-only data segments or sections
+        data_vars_to_readonly_data: List[DataVariable] = []
+        for (
+            _data_var_addr,
+            candidate_string_slice_data_ptr,
+        ) in self.bv.data_vars.items():
+            if isinstance(candidate_string_slice_data_ptr.type, PointerType):
+                for readonly_segment_or_section in (
+                    readonly_segments + readonly_sections
+                ):
+                    if (
+                        candidate_string_slice_data_ptr.value
+                        in readonly_segment_or_section
+                    ):
+                        data_vars_to_readonly_data.append(
+                            candidate_string_slice_data_ptr
+                        )
+                        logger.log_debug(
+                            f"Found pointer var at {candidate_string_slice_data_ptr.address:#x} ({candidate_string_slice_data_ptr}) pointing to {candidate_string_slice_data_ptr.value:#x} "
+                        )
+
+        for candidate_string_slice_data_ptr in data_vars_to_readonly_data:
+            # Try to read an integer following the data var,
+            # and treat it as a candidate for a string slice length.
+            candidate_string_slice_len_addr = (
+                candidate_string_slice_data_ptr.address
+                + candidate_string_slice_data_ptr.type.width
+            )
+
+            # Filter out anything at the candidate address
+            # that's already defined as any data var type which is not an integer.
+            existing_data_var_at_candidate_string_slice_len_addr = (
+                self.bv.get_data_var_at(candidate_string_slice_len_addr)
+            )
+            if existing_data_var_at_candidate_string_slice_len_addr is not None:
+                if not isinstance(
+                    existing_data_var_at_candidate_string_slice_len_addr.type,
+                    IntegerType,
+                ):
+                    continue
+
+            candidate_string_slice_len = self.bv.read_int(
+                address=candidate_string_slice_len_addr,
+                size=self.bv.arch.address_size,  # In Rust's definition of the `str` type, this length is a `usize`, which is defined to be the same size as the size of pointers for the platform.
+                sign=False,
+                endian=self.bv.arch.endianness,
+            )
+
+            logger.log_debug(
+                f"Pointer var at {candidate_string_slice_data_ptr.address:#x} is followed by integer with value {candidate_string_slice_len:#x}"
+            )
+
+            # Filter out any potential string slice which has length 0
+            if candidate_string_slice_len == 0:
+                continue
+            # Filter out any potential string slice which is too long
+            if candidate_string_slice_len >= 0x1000:  # TODO: maybe change this limit
+                continue
+
+            # Attempt to read out the pointed to value as a string slice, with the length obtained above.
+            try:
+                candidate_string_slice = self.bv.read(
+                    addr=candidate_string_slice_data_ptr.value,
+                    length=candidate_string_slice_len,
+                )
+            except Exception as err:
+                logger.log_error(
+                    f"Failed to read from address {candidate_string_slice_data_ptr.value} with length {candidate_string_slice_len}: {err}"
+                )
+                continue
+
+            logger.log_debug(
+                f"Obtained candidate string slice with addr {candidate_string_slice_data_ptr.value:#x}, len {candidate_string_slice_len:#x}: {candidate_string_slice}"
+            )
+
+            # Sanity check whether the recovered string is valid UTF-8
+            try:
+                candidate_utf8_string = candidate_string_slice.decode("utf-8")
+                logger.log_info(
+                    f'Recovered string at addr {candidate_string_slice_data_ptr.value:#x}, len {candidate_string_slice_len:#x}: "{candidate_utf8_string}"'
+                )
+
+                # Set the char[<candidate_string_slice_len>] type on the location pointed to by the data var.
+                existing_string_slice_data = self.bv.get_data_var_at(
+                    candidate_string_slice_data_ptr.value
+                )
+                if existing_string_slice_data is not None:
+                    self.bv.undefine_user_data_var(
+                        addr=candidate_string_slice_data_ptr.value
+                    )
+
+                self.bv.define_user_data_var(
+                    addr=candidate_string_slice_data_ptr.value,
+                    var_type=Type.array(
+                        type=Type.char(), count=candidate_string_slice_len
+                    ),
+                )
+
+                # Set the RustStringSlice type on the location of the data var.
+                RustStringSlice.create_binary_ninja_instance(
+                    bv=self.bv,
+                    location=candidate_string_slice_data_ptr.address,
+                    name=f'str_"{candidate_utf8_string}"',
+                )
+
+            except UnicodeDecodeError as err:
+                logger.log_warn(
+                    f"Candidate string slice {candidate_string_slice} does not decode to a valid UTF-8 string; excluding from final results: {err}"
+                )
+                continue
+
+        self.bv.commit_undo_actions()
+        self.bv.update_analysis()
+
+
+def recover_panic_location_metadata_structure(bv: BinaryView):
 
     def find_string_slice_variables_containing_source_file_path(
         bv: BinaryView,
@@ -175,7 +367,8 @@ def main(bv):
                         f"Added tag {panic_location_path} at {code_ref_address}"
                     )
 
-    CorePanicLocation.create_binary_ninja_type(bv)
+    if not CorePanicLocation.check_binary_ninja_type_exists(bv):
+        CorePanicLocation.create_binary_ninja_type(bv)
 
     bv.begin_undo_actions()
 
@@ -189,6 +382,20 @@ def main(bv):
     bv.update_analysis()
 
 
+def find_panic_location_paths(bv: BinaryView):
+    if not RustStringSlice.check_binary_ninja_type_exists(bv):
+        RustStringSlice.create_binary_ninja_type(bv)
+        RecoverPanicPathStringsFromReadOnlyDataTask(bv=bv).start()
+
+
 PluginCommand.register(
-    "find_panic_paths", "Find Rust panic location source paths", main
+    "Rust Metadata Carver\\Find Panic Location Paths",
+    "Find Rust panic location source paths",
+    find_panic_location_paths,
+)
+
+PluginCommand.register(
+    "Rust Metadata Carver\\Recover Panic Location Metadata Structures",
+    "Recover panic location metadata structures",
+    recover_panic_location_metadata_structure,
 )
