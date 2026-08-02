@@ -364,7 +364,7 @@ def recover_panic_location_metadata_structure(bv: BinaryView):
                         user=True,
                     )
                     logger.log_info(
-                        f"Added tag {panic_location_path} at {code_ref_address}"
+                        f"Added tag \"{panic_location_path}: line {panic_location_line}, col {panic_location_col}\" at {code_ref_address:#x}"
                     )
 
     if not CorePanicLocation.check_binary_ninja_type_exists(bv):
