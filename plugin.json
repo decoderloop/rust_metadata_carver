@@ -2,10 +2,6 @@
   "pluginmetadataversion": 2,
   "name": "Rust Metadata Carver",
   "type": [
-    "core",
-    "ui",
-    "architecture",
-    "binaryview",
     "helper"
   ],
   "api": [
